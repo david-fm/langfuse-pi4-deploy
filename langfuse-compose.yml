@@ -1,14 +1,14 @@
-# Langfuse self-host compose for Dockploy on Raspberry Pi 4 8GB.
+# Langfuse v4 self-host compose for Dokploy on Raspberry Pi 4 8GB.
 #
-# 9 services: zookeeper + clickhouse (Pi4 ARMv8.0) + postgres + redis +
-# minio + minio-init + clickhouse-fix (DateTime64 migration) +
-# langfuse-worker + langfuse-web (:3001).
+# 8 services: zookeeper + clickhouse (Pi4 ARMv8.0) + postgres + redis +
+# minio + minio-init + langfuse-worker + langfuse-web (:3001).
+#
+# Langfuse v4 uses observation-centric data model with new events_full/events_core
+# tables at DateTime64(6), fixing the microsecond timestamp clamping on ARM.
+# V3 tables (traces/observations/scores) are frozen; new data flows through v4 tables.
 #
 # ClickHouse: builds from deploy/clickhouse-pi4/Dockerfile (ARMv8.0 compat).
-# clickhouse-fix: one-shot ALTER TABLE to widen DateTime64(3)→DateTime64(6)
-#   so langfuse worker's microsecond timestamps display correctly.
-#   Re-runs on every deploy (idempotent, skips if already widened).
-# MinIO: required by langfuse v3 OTel ingest (S3 write before queue).
+# MinIO: required by langfuse OTel ingest (S3 write before queue).
 #
 # Pi 4 8GB sizing: ~1.5GB idle, ~3.7GB under load.
 
@@ -113,26 +113,8 @@ services:
       "
     restart: "no"
 
-  langfuse-clickhouse-fix:
-    image: alpine:latest
-    restart: "no"
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        apk add --no-cache wget &&
-        sh /fix.sh
-    volumes:
-      - ./clickhouse-pi4/fix-datetime-columns.sh:/fix.sh:ro
-    environment:
-      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
-      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-langfuse}
-      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-langfuse_pw}
-    depends_on:
-      langfuse-clickhouse:
-        condition: service_healthy
-
   langfuse-worker:
-    image: langfuse/langfuse-worker:3
+    image: langfuse/langfuse-worker:4
     restart: unless-stopped
     mem_limit: 1g
     mem_reservation: 512m
@@ -144,8 +126,6 @@ services:
       langfuse-clickhouse:
         condition: service_healthy
       langfuse-minio-init:
-        condition: service_completed_successfully
-      langfuse-clickhouse-fix:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: postgresql://${LANGFUSE_PG_USER:-langfuse}:${LANGFUSE_PG_PASSWORD:-langfuse_pw}@langfuse-postgres:5432/${LANGFUSE_PG_DB:-langfuse}
@@ -166,9 +146,14 @@ services:
       SALT: ${LANGFUSE_SALT:-change-me-in-production-please-32-chars}
       TELEMETRY_ENABLED: "false"
       LANGFUSE_LOG_LEVEL: info
+      LANGFUSE_MIGRATION_V4_WRITE_MODE: dual
+      LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN: "true"
+      LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR: direct
+      LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL: "false"
+      CLICKHOUSE_DISABLE_LAZY_MATERIALIZATION: "true"
 
   langfuse-web:
-    image: langfuse/langfuse:3
+    image: langfuse/langfuse:4
     restart: unless-stopped
     mem_limit: 1g
     mem_reservation: 512m
@@ -182,8 +167,6 @@ services:
       langfuse-clickhouse:
         condition: service_healthy
       langfuse-minio-init:
-        condition: service_completed_successfully
-      langfuse-clickhouse-fix:
         condition: service_completed_successfully
       langfuse-worker:
         condition: service_started
@@ -216,6 +199,11 @@ services:
       LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-Janus Admin}
       TELEMETRY_ENABLED: "false"
       LANGFUSE_LOG_LEVEL: info
+      LANGFUSE_MIGRATION_V4_WRITE_MODE: dual
+      LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN: "true"
+      LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR: direct
+      LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL: "false"
+      CLICKHOUSE_DISABLE_LAZY_MATERIALIZATION: "true"
 
 volumes:
   clickhouse_data:
