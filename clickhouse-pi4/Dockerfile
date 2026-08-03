@@ -1,8 +1,6 @@
 # ClickHouse for Raspberry Pi 4 — ARMv8.0 compatible build.
-
-FROM curlimages/curl AS downloader
-WORKDIR /app
-RUN curl -OL https://builds.clickhouse.com/master/aarch64v80compat/clickhouse
+# Uses stable 24.8 binary from clickhouse-common-static package.
+# The master/compat binary has broken DateTime64 precision on ARM.
 
 FROM ubuntu:20.04 AS glibc-donor
 ARG TARGETARCH=arm64
@@ -59,9 +57,7 @@ RUN arch=${TARGETARCH:-arm64} \
   && cp /usr/share/zoneinfo/UTC /etc/localtime \
   && echo "UTC" > /etc/timezone
 
-# Copy the compat binary — it self-extracts on first run ("Decompressing...")
-# This is normal and takes ~30-60s on Pi4 first boot.
-COPY --from=downloader /app/clickhouse /usr/bin/clickhouse
+# Use the stable binary from clickhouse-common-static (already unpacked to /)
 RUN chmod +x /usr/bin/clickhouse
 
 RUN mkdir -p \
