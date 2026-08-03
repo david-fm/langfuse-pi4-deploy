@@ -210,3 +210,4 @@ volumes:
   langfuse_pg:
   langfuse_redis:
   minio_data:
+
