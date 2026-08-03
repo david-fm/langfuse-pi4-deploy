@@ -7,7 +7,7 @@
 # tables at DateTime64(6), fixing the microsecond timestamp clamping on ARM.
 # V3 tables (traces/observations/scores) are frozen; new data flows through v4 tables.
 #
-# ClickHouse: builds from deploy/clickhouse-pi4/Dockerfile (ARMv8.0 compat).
+# ClickHouse: official ARM64 image (26.4+). No custom build needed.
 # MinIO: required by langfuse OTel ingest (S3 write before queue).
 #
 # Pi 4 8GB sizing: ~1.5GB idle, ~3.7GB under load.
@@ -29,9 +29,7 @@ services:
       retries: 10
 
   langfuse-clickhouse:
-    build:
-      context: ./clickhouse-pi4
-      dockerfile: Dockerfile
+    image: clickhouse/clickhouse-server:26.4
     restart: unless-stopped
     mem_limit: 3g
     mem_reservation: 1g
@@ -42,7 +40,6 @@ services:
       CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-langfuse}
       CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-langfuse_pw}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
-      CLICKHOUSE_ALWAYS_RUN_INITDB_SCRIPTS: "1"
     depends_on:
       zookeeper:
         condition: service_healthy
