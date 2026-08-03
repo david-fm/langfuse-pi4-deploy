@@ -110,7 +110,7 @@ ch_post "CREATE TABLE langfuse.traces (
     updated_at DateTime64(6) DEFAULT now64(6),
     event_ts DateTime64(6),
     is_deleted UInt8
-) ENGINE = ReplicingMergeTree(updated_at)
+) ENGINE = ReplicatedMergeTree(updated_at)
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (timestamp, project_id, id)
 SETTINGS index_granularity = 8192"
@@ -178,7 +178,7 @@ ch_post "CREATE TABLE langfuse.observations (
     updated_at DateTime64(6) DEFAULT now64(6),
     event_ts DateTime64(6),
     is_deleted UInt8
-) ENGINE = ReplicingMergeTree(updated_at)
+) ENGINE = ReplicatedMergeTree(updated_at)
 PARTITION BY toYYYYMM(start_time)
 ORDER BY (project_id, trace_id, start_time, id)
 SETTINGS index_granularity = 8192"
@@ -231,7 +231,7 @@ ch_post "CREATE TABLE langfuse.scores (
     updated_at DateTime64(6) DEFAULT now64(6),
     event_ts DateTime64(6),
     is_deleted UInt8
-) ENGINE = ReplicingMergeTree(updated_at)
+) ENGINE = ReplicatedMergeTree(updated_at)
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (project_id, trace_id, name, id)
 SETTINGS index_granularity = 8192"
