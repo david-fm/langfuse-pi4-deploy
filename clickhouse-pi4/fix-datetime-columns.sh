@@ -74,9 +74,21 @@ echo "🔧 Starting table recreation..."
 echo ""
 echo "=== Step 1: traces table ==="
 
-ch_post "DROP TABLE IF EXISTS langfuse.traces_old"
-ch_post "RENAME TABLE langfuse.traces TO langfuse.traces_old"
-echo "  ✅ Renamed traces → traces_old"
+# Handle case where traces was already renamed to traces_old by manual intervention
+TRACES_EXISTS=$(ch_get "SELECT count(*) FROM system.tables WHERE database='langfuse' AND name='traces'")
+TRACES_OLD_EXISTS=$(ch_get "SELECT count(*) FROM system.tables WHERE database='langfuse' AND name='traces_old'")
+
+if [ "$TRACES_EXISTS" = "0" ] && [ "$TRACES_OLD_EXISTS" = "1" ]; then
+  echo "  ℹ️  traces missing, traces_old exists (manual rename). Using traces_old as source."
+  ch_post "DROP TABLE IF EXISTS langfuse.traces_old_target"
+  # Don't need to RENAME, just create new table and copy from traces_old
+elif [ "$TRACES_EXISTS" = "1" ]; then
+  ch_post "DROP TABLE IF EXISTS langfuse.traces_old"
+  ch_post "RENAME TABLE langfuse.traces TO langfuse.traces_old"
+  echo "  ✅ Renamed traces → traces_old"
+else
+  echo "  ⚠️  Neither traces nor traces_old exist. Creating fresh."
+fi
 
 ch_post "CREATE TABLE langfuse.traces (
     id String,
@@ -104,11 +116,18 @@ ORDER BY (timestamp, project_id, id)
 SETTINGS index_granularity = 8192"
 echo "  ✅ Created new traces table (DateTime64(6))"
 
-ch_post "INSERT INTO langfuse.traces SELECT * FROM langfuse.traces_old"
-echo "  ✅ Copied data"
-
-ch_post "DROP TABLE IF EXISTS langfuse.traces_old"
-echo "  ✅ Dropped traces_old"
+# Copy data from whichever source exists
+if [ "$TRACES_OLD_EXISTS" = "1" ]; then
+  ch_post "INSERT INTO langfuse.traces SELECT * FROM langfuse.traces_old"
+  echo "  ✅ Copied data from traces_old"
+  ch_post "DROP TABLE IF EXISTS langfuse.traces_old"
+  echo "  ✅ Dropped traces_old"
+elif [ "$TRACES_EXISTS" = "1" ]; then
+  ch_post "INSERT INTO langfuse.traces SELECT * FROM langfuse.traces_old"
+  echo "  ✅ Copied data from traces_old"
+  ch_post "DROP TABLE IF EXISTS langfuse.traces_old"
+  echo "  ✅ Dropped traces_old"
+fi
 
 # ============================================================
 # Step 2: Recreate observations table
@@ -116,9 +135,18 @@ echo "  ✅ Dropped traces_old"
 echo ""
 echo "=== Step 2: observations table ==="
 
-ch_post "DROP TABLE IF EXISTS langfuse.observations_old"
-ch_post "RENAME TABLE langfuse.observations TO langfuse.observations_old"
-echo "  ✅ Renamed observations → observations_old"
+OBS_EXISTS=$(ch_get "SELECT count(*) FROM system.tables WHERE database='langfuse' AND name='observations'")
+OBS_OLD_EXISTS=$(ch_get "SELECT count(*) FROM system.tables WHERE database='langfuse' AND name='observations_old'")
+
+if [ "$OBS_EXISTS" = "0" ] && [ "$OBS_OLD_EXISTS" = "1" ]; then
+  echo "  ℹ️  observations missing, observations_old exists. Using as source."
+elif [ "$OBS_EXISTS" = "1" ]; then
+  ch_post "DROP TABLE IF EXISTS langfuse.observations_old"
+  ch_post "RENAME TABLE langfuse.observations TO langfuse.observations_old"
+  echo "  ✅ Renamed observations → observations_old"
+else
+  echo "  ⚠️  Neither observations nor observations_old exist. Creating fresh."
+fi
 
 ch_post "CREATE TABLE langfuse.observations (
     id String,
@@ -156,11 +184,14 @@ ORDER BY (project_id, trace_id, start_time, id)
 SETTINGS index_granularity = 8192"
 echo "  ✅ Created new observations table (DateTime64(6))"
 
-ch_post "INSERT INTO langfuse.observations SELECT * FROM langfuse.observations_old"
-echo "  ✅ Copied data"
-
-ch_post "DROP TABLE IF EXISTS langfuse.observations_old"
-echo "  ✅ Dropped observations_old"
+if [ "$OBS_OLD_EXISTS" = "1" ] || [ "$OBS_EXISTS" = "1" ]; then
+  SOURCE_TABLE="observations_old"
+  if [ "$OBS_OLD_EXISTS" = "0" ]; then SOURCE_TABLE="observations_old"; fi
+  ch_post "INSERT INTO langfuse.observations SELECT * FROM langfuse.${SOURCE_TABLE}"
+  echo "  ✅ Copied data from ${SOURCE_TABLE}"
+  ch_post "DROP TABLE IF EXISTS langfuse.observations_old"
+  echo "  ✅ Dropped observations_old"
+fi
 
 # ============================================================
 # Step 3: Recreate scores table
@@ -168,9 +199,18 @@ echo "  ✅ Dropped observations_old"
 echo ""
 echo "=== Step 3: scores table ==="
 
-ch_post "DROP TABLE IF EXISTS langfuse.scores_old"
-ch_post "RENAME TABLE langfuse.scores TO langfuse.scores_old"
-echo "  ✅ Renamed scores → scores_old"
+SCORES_EXISTS=$(ch_get "SELECT count(*) FROM system.tables WHERE database='langfuse' AND name='scores'")
+SCORES_OLD_EXISTS=$(ch_get "SELECT count(*) FROM system.tables WHERE database='langfuse' AND name='scores_old'")
+
+if [ "$SCORES_EXISTS" = "0" ] && [ "$SCORES_OLD_EXISTS" = "1" ]; then
+  echo "  ℹ️  scores missing, scores_old exists. Using as source."
+elif [ "$SCORES_EXISTS" = "1" ]; then
+  ch_post "DROP TABLE IF EXISTS langfuse.scores_old"
+  ch_post "RENAME TABLE langfuse.scores TO langfuse.scores_old"
+  echo "  ✅ Renamed scores → scores_old"
+else
+  echo "  ⚠️  Neither scores nor scores_old exist. Creating fresh."
+fi
 
 ch_post "CREATE TABLE langfuse.scores (
     id String,
@@ -197,11 +237,14 @@ ORDER BY (project_id, trace_id, name, id)
 SETTINGS index_granularity = 8192"
 echo "  ✅ Created new scores table (DateTime64(6))"
 
-ch_post "INSERT INTO langfuse.scores SELECT * FROM langfuse.scores_old"
-echo "  ✅ Copied data"
-
-ch_post "DROP TABLE IF EXISTS langfuse.scores_old"
-echo "  ✅ Dropped scores_old"
+if [ "$SCORES_OLD_EXISTS" = "1" ] || [ "$SCORES_EXISTS" = "1" ]; then
+  SOURCE_TABLE="scores_old"
+  if [ "$SCORES_OLD_EXISTS" = "0" ]; then SOURCE_TABLE="scores_old"; fi
+  ch_post "INSERT INTO langfuse.scores SELECT * FROM langfuse.${SOURCE_TABLE}"
+  echo "  ✅ Copied data from ${SOURCE_TABLE}"
+  ch_post "DROP TABLE IF EXISTS langfuse.scores_old"
+  echo "  ✅ Dropped scores_old"
+fi
 
 # ============================================================
 # Verify
