@@ -1,26 +1,16 @@
 # Langfuse self-host compose for Dockploy on Raspberry Pi 4 8GB.
 #
-# 7 services: clickhouse (Pi4-compatible build) + postgres (auth) +
-# redis (queue) + minio (S3-compatible blob store, required by langfuse
-# v3 OTel ingest path) + minio-init (one-shot bucket creator) +
-# langfuse-worker (async processor) + langfuse-web (UI + API on :3001).
+# 9 services: zookeeper + clickhouse (Pi4 ARMv8.0) + postgres + redis +
+# minio + minio-init + clickhouse-fix (DateTime64 migration) +
+# langfuse-worker + langfuse-web (:3001).
 #
-# ClickHouse: builds from deploy/clickhouse-pi4/Dockerfile which uses
-# the ARMv8.0 compatibility binary (official image requires ARMv8.2-A).
+# ClickHouse: builds from deploy/clickhouse-pi4/Dockerfile (ARMv8.0 compat).
+# clickhouse-fix: one-shot ALTER TABLE to widen DateTime64(3)→DateTime64(6)
+#   so langfuse worker's microsecond timestamps display correctly.
+#   Re-runs on every deploy (idempotent, skips if already widened).
+# MinIO: required by langfuse v3 OTel ingest (S3 write before queue).
 #
-# First boot: open https://<your-cloudflare-tunnel>, sign up, create a project
-# named "janus", copy LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY into your Mac's
-# .env file. Cloudflared config is separate — point at langfuse-web:3001.
-#
-# Pi 4 8GB sizing: ~1.4GB idle, ~3.6GB under load. Headroom OK.
-# ClickHouse is built locally on the Pi (first deploy takes ~5 min for
-# the binary download + build).
-#
-# MinIO: langfuse v3 OTel ingest ALWAYS writes raw spans to S3 before
-# queuing them for the worker (LANGFUSE_S3_EVENT_UPLOAD_ENABLED is bypassed).
-# Without a working S3 endpoint, "Region is missing" crashes every batch.
-# MinIO is the S3-compatible store langfuse ships by default in its
-# official compose. ~150-250MB RAM.
+# Pi 4 8GB sizing: ~1.5GB idle, ~3.7GB under load.
 
 services:
   zookeeper:
@@ -123,6 +113,24 @@ services:
       "
     restart: "no"
 
+  langfuse-clickhouse-fix:
+    image: alpine:latest
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache wget &&
+        sh /fix.sh
+    volumes:
+      - ./clickhouse-pi4/fix-datetime-columns.sh:/fix.sh:ro
+    environment:
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-langfuse}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-langfuse_pw}
+    depends_on:
+      langfuse-clickhouse:
+        condition: service_healthy
+
   langfuse-worker:
     image: langfuse/langfuse-worker:3
     restart: unless-stopped
@@ -136,6 +144,8 @@ services:
       langfuse-clickhouse:
         condition: service_healthy
       langfuse-minio-init:
+        condition: service_completed_successfully
+      langfuse-clickhouse-fix:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: postgresql://${LANGFUSE_PG_USER:-langfuse}:${LANGFUSE_PG_PASSWORD:-langfuse_pw}@langfuse-postgres:5432/${LANGFUSE_PG_DB:-langfuse}
@@ -172,6 +182,8 @@ services:
       langfuse-clickhouse:
         condition: service_healthy
       langfuse-minio-init:
+        condition: service_completed_successfully
+      langfuse-clickhouse-fix:
         condition: service_completed_successfully
       langfuse-worker:
         condition: service_started

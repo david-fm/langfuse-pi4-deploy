@@ -27,8 +27,8 @@ COPY docker_related_config.xml /etc/clickhouse-server/config.d/
 COPY config.xml /etc/clickhouse-server/config.xml
 COPY users.xml /etc/clickhouse-server/users.xml
 COPY entrypoint.sh /entrypoint.sh
-
-ARG TARGETARCH
+COPY fix-datetime-columns.sh /fix-datetime-columns.sh
+RUN chmod +x /entrypoint.sh /fix-datetime-columns.sh
 RUN arch=${TARGETARCH:-arm64} \
   && case $arch in \
   amd64) mkdir -p /lib64 && ln -sf /lib/ld-2.31.so /lib64/ld-linux-x86-64.so.2 ;; \
