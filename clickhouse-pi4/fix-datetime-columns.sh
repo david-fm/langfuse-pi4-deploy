@@ -5,19 +5,19 @@
 # columns. On ARMv8.0 ClickHouse, values > max DateTime64(3) are clamped
 # to 9999-12-31 23:59:59.000, making traces invisible in the UI.
 #
-# Solution: recreate tables with DateTime64(6). Data is copied as-is —
-# the same Int64 value that was "too large for ms" fits perfectly in us.
+# Solution: recreate tables with DateTime64(6). Data is copied as-is.
 #
 # Key columns (timestamp, start_time) CANNOT be ALTERed in ClickHouse.
 # We must recreate the entire table.
 #
 # This script:
-# 1. Creates new tables with correct schema
-# 2. Copies data from old tables
-# 3. Drops old tables
-# 4. Renames new tables to original names
+# 1. Renames old tables to _old
+# 2. Creates new tables with correct schema (DateTime64(6))
+# 3. Copies data from old tables
+# 4. Drops old tables
 #
-# Idempotent: skips if columns already use DateTime64(6).
+# Idempotent: skips if timestamp column already DateTime64(6).
+# Uses POST for DDL (GET doesn't work for DDL in ClickHouse HTTP).
 
 set -e
 
@@ -25,11 +25,19 @@ CLICKHOUSE_URL="${CLICKHOUSE_URL:-http://langfuse-clickhouse:8123}"
 CLICKHOUSE_USER="${CLICKHOUSE_USER:-langfuse}"
 CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-langfuse_pw}"
 
-ch() {
+ch_get() {
   wget -q -O- \
     --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
     --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" \
-    "${CLICKHOUSE_URL}/?query=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$1'))")"
+    "${CLICKHOUSE_URL}/?query=$(echo "$1" | sed 's/ /+/g')"
+}
+
+ch_post() {
+  wget -q -O /dev/null \
+    --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
+    --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" \
+    --post-data="$1" \
+    "${CLICKHOUSE_URL}/"
 }
 
 echo "⏳ Waiting for ClickHouse..."
@@ -43,18 +51,14 @@ echo "✅ ClickHouse ready."
 # Wait for langfuse tables
 echo "⏳ Waiting for langfuse.traces..."
 for i in $(seq 1 30); do
-  RESULT=$(wget -q -O- "${CLICKHOUSE_URL}/?query=SELECT%20count(*)%20FROM%20system.tables%20WHERE%20database=%27langfuse%27%20AND%20name=%27traces%27" \
-    --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-    --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null)
+  RESULT=$(ch_get "SELECT count(*) FROM system.tables WHERE database='langfuse' AND name='traces'")
   if [ "$RESULT" = "1" ]; then break; fi
   sleep 2
 done
 echo "✅ langfuse.traces exists."
 
 # Check if migration already done
-CURRENT=$(wget -q -O- "${CLICKHOUSE_URL}/?query=SELECT%20type%20FROM%20system.columns%20WHERE%20database=%27langfuse%27%20AND%20table=%27traces%27%20AND%20name=%27timestamp%27" \
-  --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-  --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null)
+CURRENT=$(ch_get "SELECT type FROM system.columns WHERE database='langfuse' AND table='traces' AND name='timestamp'")
 
 if [ "$CURRENT" = "DateTime64(6)" ]; then
   echo "✅ Already migrated (timestamp is DateTime64(6)). Nothing to do."
@@ -70,24 +74,11 @@ echo "🔧 Starting table recreation..."
 echo ""
 echo "=== Step 1: traces table ==="
 
-# Drop old table
-wget -q -O /dev/null "${CLICKHOUSE_URL}/?query=DROP%20TABLE%20IF%20EXISTS%20langfuse.traces_old" \
-  --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-  --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null
-
-# Rename current to _old
-wget -q -O /dev/null "${CLICKHOUSE_URL}/?query=RENAME%20TABLE%20langfuse.traces%20TO%20langfuse.traces_old" \
-  --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-  --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null
+ch_post "DROP TABLE IF EXISTS langfuse.traces_old"
+ch_post "RENAME TABLE langfuse.traces TO langfuse.traces_old"
 echo "  ✅ Renamed traces → traces_old"
 
-# Create new table with DateTime64(6)
-cat << 'EOSQL' | wget -q -O /dev/null "${CLICKHOUSE_URL}/" \
-  --header="X-ClickHouse-User: langfuse" \
-  --header="X-ClickHouse-Key: langfuse_pw" \
-  --post-data-binary @- 2>/dev/null
-CREATE TABLE langfuse.traces
-(
+ch_post "CREATE TABLE langfuse.traces (
     id String,
     timestamp DateTime64(6),
     name String,
@@ -107,24 +98,16 @@ CREATE TABLE langfuse.traces
     updated_at DateTime64(6) DEFAULT now64(6),
     event_ts DateTime64(6),
     is_deleted UInt8
-)
-ENGINE = RepReplacingMergeTree(updated_at)
+) ENGINE = ReplicingMergeTree(updated_at)
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (timestamp, project_id, id)
-SETTINGS index_granularity = 8192
-EOSQL
+SETTINGS index_granularity = 8192"
 echo "  ✅ Created new traces table (DateTime64(6))"
 
-# Copy data
-wget -q -O /dev/null "${CLICKHOUSE_URL}/?query=INSERT%20INTO%20langfuse.traces%20SELECT%20*%20FROM%20langfuse.traces_old" \
-  --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-  --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null
-echo "  ✅ Copied data from traces_old"
+ch_post "INSERT INTO langfuse.traces SELECT * FROM langfuse.traces_old"
+echo "  ✅ Copied data"
 
-# Drop old table
-wget -q -O /dev/null "${CLICKHOUSE_URL}/?query=DROP%20TABLE%20IF%20EXISTS%20langfuse.traces_old" \
-  --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-  --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null
+ch_post "DROP TABLE IF EXISTS langfuse.traces_old"
 echo "  ✅ Dropped traces_old"
 
 # ============================================================
@@ -133,21 +116,11 @@ echo "  ✅ Dropped traces_old"
 echo ""
 echo "=== Step 2: observations table ==="
 
-wget -q -O /dev/null "${CLICKHOUSE_URL}/?query=DROP%20TABLE%20IF%20EXISTS%20langfuse.observations_old" \
-  --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-  --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null
-
-wget -q -O /dev/null "${CLICKHOUSE_URL}/?query=RENAME%20TABLE%20langfuse.observations%20TO%20langfuse.observations_old" \
-  --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-  --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null
+ch_post "DROP TABLE IF EXISTS langfuse.observations_old"
+ch_post "RENAME TABLE langfuse.observations TO langfuse.observations_old"
 echo "  ✅ Renamed observations → observations_old"
 
-cat << 'EOSQL' | wget -q -O /dev/null "${CLICKHOUSE_URL}/" \
-  --header="X-ClickHouse-User: langfuse" \
-  --header="X-ClickHouse-Key: langfuse_pw" \
-  --post-data-binary @- 2>/dev/null
-CREATE TABLE langfuse.observations
-(
+ch_post "CREATE TABLE langfuse.observations (
     id String,
     trace_id String,
     project_id String,
@@ -177,22 +150,16 @@ CREATE TABLE langfuse.observations
     updated_at DateTime64(6) DEFAULT now64(6),
     event_ts DateTime64(6),
     is_deleted UInt8
-)
-ENGINE = RepReplacingMergeTree(updated_at)
+) ENGINE = ReplicingMergeTree(updated_at)
 PARTITION BY toYYYYMM(start_time)
 ORDER BY (project_id, trace_id, start_time, id)
-SETTINGS index_granularity = 8192
-EOSQL
+SETTINGS index_granularity = 8192"
 echo "  ✅ Created new observations table (DateTime64(6))"
 
-wget -q -O /dev/null "${CLICKHOUSE_URL}/?query=INSERT%20INTO%20langfuse.observations%20SELECT%20*%20FROM%20langfuse.observations_old" \
-  --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-  --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null
-echo "  ✅ Copied data from observations_old"
+ch_post "INSERT INTO langfuse.observations SELECT * FROM langfuse.observations_old"
+echo "  ✅ Copied data"
 
-wget -q -O /dev/null "${CLICKHOUSE_URL}/?query=DROP%20TABLE%20IF%20EXISTS%20langfuse.observations_old" \
-  --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-  --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null
+ch_post "DROP TABLE IF EXISTS langfuse.observations_old"
 echo "  ✅ Dropped observations_old"
 
 # ============================================================
@@ -201,21 +168,11 @@ echo "  ✅ Dropped observations_old"
 echo ""
 echo "=== Step 3: scores table ==="
 
-wget -q -O /dev/null "${CLICKHOUSE_URL}/?query=DROP%20TABLE%20IF%20EXISTS%20langfuse.scores_old" \
-  --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-  --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null
-
-wget -q -O /dev/null "${CLICKHOUSE_URL}/?query=RENAME%20TABLE%20langfuse.scores%20TO%20langfuse.scores_old" \
-  --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-  --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null
+ch_post "DROP TABLE IF EXISTS langfuse.scores_old"
+ch_post "RENAME TABLE langfuse.scores TO langfuse.scores_old"
 echo "  ✅ Renamed scores → scores_old"
 
-cat << 'EOSQL' | wget -q -O /dev/null "${CLICKHOUSE_URL}/" \
-  --header="X-ClickHouse-User: langfuse" \
-  --header="X-ClickHouse-Key: langfuse_pw" \
-  --post-data-binary @- 2>/dev/null
-CREATE TABLE langfuse.scores
-(
+ch_post "CREATE TABLE langfuse.scores (
     id String,
     project_id String,
     timestamp DateTime64(6),
@@ -234,22 +191,16 @@ CREATE TABLE langfuse.scores
     updated_at DateTime64(6) DEFAULT now64(6),
     event_ts DateTime64(6),
     is_deleted UInt8
-)
-ENGINE = ReplicingMergeTree(updated_at)
+) ENGINE = ReplicingMergeTree(updated_at)
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (project_id, trace_id, name, id)
-SETTINGS index_granularity = 8192
-EOSQL
+SETTINGS index_granularity = 8192"
 echo "  ✅ Created new scores table (DateTime64(6))"
 
-wget -q -O /dev/null "${CLICKHOUSE_URL}/?query=INSERT%20INTO%20langfuse.scores%20SELECT%20*%20FROM%20langfuse.scores_old" \
-  --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-  --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null
-echo "  ✅ Copied data from scores_old"
+ch_post "INSERT INTO langfuse.scores SELECT * FROM langfuse.scores_old"
+echo "  ✅ Copied data"
 
-wget -q -O /dev/null "${CLICKHOUSE_URL}/?query=DROP%20TABLE%20IF%20EXISTS%20langfuse.scores_old" \
-  --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-  --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null
+ch_post "DROP TABLE IF EXISTS langfuse.scores_old"
 echo "  ✅ Dropped scores_old"
 
 # ============================================================
@@ -258,12 +209,8 @@ echo "  ✅ Dropped scores_old"
 echo ""
 echo "=== Verification ==="
 for t in traces observations scores; do
-  TYPE=$(wget -q -O- "${CLICKHOUSE_URL}/?query=SELECT%20type%20FROM%20system.columns%20WHERE%20database=%27langfuse%27%20AND%20table=%27${t}%27%20AND%20name%20IN%20(%27timestamp%27,%27start_time%27)%20LIMIT%201" \
-    --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-    --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null)
-  COUNT=$(wget -q -O- "${CLICKHOUSE_URL}/?query=SELECT%20count(*)%20FROM%20langfuse.${t}" \
-    --header="X-ClickHouse-User: ${CLICKHOUSE_USER}" \
-    --header="X-ClickHouse-Key: ${CLICKHOUSE_PASSWORD}" 2>/dev/null)
+  TYPE=$(ch_get "SELECT type FROM system.columns WHERE database='langfuse' AND table='${t}' AND name IN ('timestamp','start_time') LIMIT 1")
+  COUNT=$(ch_get "SELECT count(*) FROM langfuse.${t}")
   echo "  ${t}: type=${TYPE} rows=${COUNT}"
 done
 
