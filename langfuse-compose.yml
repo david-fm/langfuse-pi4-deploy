@@ -1,8 +1,9 @@
 # Langfuse self-host compose for Dockploy on Raspberry Pi 4 8GB.
 #
-# 5 services: clickhouse (Pi4-compatible build) + postgres (auth) +
-# redis (queue) + langfuse-worker (async processor) + langfuse-web
-# (UI + API on :3001).
+# 7 services: clickhouse (Pi4-compatible build) + postgres (auth) +
+# redis (queue) + minio (S3-compatible blob store, required by langfuse
+# v3 OTel ingest path) + minio-init (one-shot bucket creator) +
+# langfuse-worker (async processor) + langfuse-web (UI + API on :3001).
 #
 # ClickHouse: builds from deploy/clickhouse-pi4/Dockerfile which uses
 # the ARMv8.0 compatibility binary (official image requires ARMv8.2-A).
@@ -11,9 +12,15 @@
 # named "janus", copy LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY into your Mac's
 # .env file. Cloudflared config is separate — point at langfuse-web:3001.
 #
-# Pi 4 8GB sizing: ~1.2GB idle, ~3.2GB under load. Plenty of headroom.
+# Pi 4 8GB sizing: ~1.4GB idle, ~3.6GB under load. Headroom OK.
 # ClickHouse is built locally on the Pi (first deploy takes ~5 min for
 # the binary download + build).
+#
+# MinIO: langfuse v3 OTel ingest ALWAYS writes raw spans to S3 before
+# queuing them for the worker (LANGFUSE_S3_EVENT_UPLOAD_ENABLED is bypassed).
+# Without a working S3 endpoint, "Region is missing" crashes every batch.
+# MinIO is the S3-compatible store langfuse ships by default in its
+# official compose. ~150-250MB RAM.
 
 services:
   zookeeper:
@@ -85,6 +92,37 @@ services:
       timeout: 5s
       retries: 5
 
+  langfuse-minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    mem_limit: 512m
+    mem_reservation: 256m
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${LANGFUSE_S3_ACCESS_KEY_ID:-langfuse}
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_S3_SECRET_ACCESS_KEY:-langfuse-minio-dev}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  langfuse-minio-init:
+    image: minio/mc:latest
+    depends_on:
+      langfuse-minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://langfuse-minio:9000 ${LANGFUSE_S3_ACCESS_KEY_ID:-langfuse} ${LANGFUSE_S3_SECRET_ACCESS_KEY:-langfuse-minio-dev} &&
+      mc mb local/${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse-events} --ignore-existing &&
+      echo 'langfuse-events bucket ready.'
+      "
+    restart: "no"
+
   langfuse-worker:
     image: langfuse/langfuse-worker:3
     restart: unless-stopped
@@ -97,15 +135,24 @@ services:
         condition: service_healthy
       langfuse-clickhouse:
         condition: service_healthy
+      langfuse-minio-init:
+        condition: service_completed_successfully
     environment:
       DATABASE_URL: postgresql://${LANGFUSE_PG_USER:-langfuse}:${LANGFUSE_PG_PASSWORD:-langfuse_pw}@langfuse-postgres:5432/${LANGFUSE_PG_DB:-langfuse}
       REDIS_URL: redis://langfuse-redis:6379
+      REDIS_CONNECTION_STRING: redis://langfuse-redis:6379
       CLICKHOUSE_URL: http://${LANGFUSE_CLICKHOUSE_USER:-langfuse}:${LANGFUSE_CLICKHOUSE_PASSWORD:-langfuse_pw}@langfuse-clickhouse:8123/${LANGFUSE_CLICKHOUSE_DB:-langfuse}
       CLICKHOUSE_MIGRATION_URL: clickhouse://${LANGFUSE_CLICKHOUSE_USER:-langfuse}:${LANGFUSE_CLICKHOUSE_PASSWORD:-langfuse_pw}@langfuse-clickhouse:9000/${LANGFUSE_CLICKHOUSE_DB:-langfuse}
       CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-langfuse}
       CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-langfuse_pw}
       CLICKHOUSE_DB: ${LANGFUSE_CLICKHOUSE_DB:-langfuse}
-      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "disabled"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse-events}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_EVENT_UPLOAD_REGION:-us-east-1}
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_ACCESS_KEY_ID:-langfuse}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_SECRET_ACCESS_KEY:-langfuse-minio-dev}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: "events/"
       SALT: ${LANGFUSE_SALT:-change-me-in-production-please-32-chars}
       TELEMETRY_ENABLED: "false"
       LANGFUSE_LOG_LEVEL: info
@@ -124,17 +171,26 @@ services:
         condition: service_healthy
       langfuse-clickhouse:
         condition: service_healthy
+      langfuse-minio-init:
+        condition: service_completed_successfully
       langfuse-worker:
         condition: service_started
     environment:
       DATABASE_URL: postgresql://${LANGFUSE_PG_USER:-langfuse}:${LANGFUSE_PG_PASSWORD:-langfuse_pw}@langfuse-postgres:5432/${LANGFUSE_PG_DB:-langfuse}
       REDIS_URL: redis://langfuse-redis:6379
+      REDIS_CONNECTION_STRING: redis://langfuse-redis:6379
       CLICKHOUSE_URL: http://${LANGFUSE_CLICKHOUSE_USER:-langfuse}:${LANGFUSE_CLICKHOUSE_PASSWORD:-langfuse_pw}@langfuse-clickhouse:8123/${LANGFUSE_CLICKHOUSE_DB:-langfuse}
       CLICKHOUSE_MIGRATION_URL: clickhouse://${LANGFUSE_CLICKHOUSE_USER:-langfuse}:${LANGFUSE_CLICKHOUSE_PASSWORD:-langfuse_pw}@langfuse-clickhouse:9000/${LANGFUSE_CLICKHOUSE_DB:-langfuse}
       CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-langfuse}
       CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-langfuse_pw}
       CLICKHOUSE_DB: ${LANGFUSE_CLICKHOUSE_DB:-langfuse}
-      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "disabled"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse-events}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_EVENT_UPLOAD_REGION:-us-east-1}
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_ACCESS_KEY_ID:-langfuse}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_SECRET_ACCESS_KEY:-langfuse-minio-dev}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: "events/"
       SALT: ${LANGFUSE_SALT:-change-me-in-production-please-32-chars}
       NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:?NEXTAUTH_SECRET is required (32+ char random)}
       NEXTAUTH_URL: ${LANGFUSE_NEXTAUTH_URL:-http://localhost:3001}
@@ -153,3 +209,4 @@ volumes:
   clickhouse_data:
   langfuse_pg:
   langfuse_redis:
+  minio_data:

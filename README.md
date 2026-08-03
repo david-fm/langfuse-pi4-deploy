@@ -10,8 +10,9 @@ is set in `.env`).
 
 ## Files
 
-- `langfuse-compose.yml` — 5-service stack (clickhouse, postgres, redis, worker, web).
-  Copy this into Dockploy as a new app on your Pi.
+- `langfuse-compose.yml` — 8-service stack (zookeeper, clickhouse, postgres,
+  redis, **minio + minio-init**, worker, web). Copy this into Dockploy as a
+  new app on your Pi.
 - `clickhouse-pi4/` — Custom ClickHouse Dockerfile + entrypoint for Pi 4.
   Uses the ARMv8.0 compatibility binary from `builds.clickhouse.com`.
 
@@ -42,6 +43,10 @@ Optional (defaults shown):
 | `LANGFUSE_INIT_PROJECT_NAME` | `Janus` |
 | `LANGFUSE_INIT_USER_EMAIL` / `_PASSWORD` / `_NAME` | (empty — manual signup) |
 | `LANGFUSE_INIT_PROJECT_PUBLIC_KEY` / `_SECRET_KEY` | (empty — created on signup) |
+| `LANGFUSE_S3_EVENT_UPLOAD_BUCKET` | `langfuse-events` |
+| `LANGFUSE_S3_EVENT_UPLOAD_REGION` | `us-east-1` |
+| `LANGFUSE_S3_ACCESS_KEY_ID` | `langfuse` (must match `MINIO_ROOT_USER`) |
+| `LANGFUSE_S3_SECRET_ACCESS_KEY` | `langfuse-minio-dev` (must match `MINIO_ROOT_PASSWORD`) |
 | `LANGFUSE_NEXTAUTH_URL` | `http://localhost:3000` (override with your tunnel URL once known) |
 
 ### 2. Paste `langfuse-compose.yml` into Dockploy
@@ -139,6 +144,7 @@ Langfuse data lives in 3 named Docker volumes on the Pi:
 | `clickhouse_data` | Trace observations (the bulk) | ~500MB |
 | `langfuse_pg` | Users, projects, API keys | ~50MB |
 | `langfuse_redis` | Job queue (transient) | ~10MB |
+| `minio_data` | Raw OTel event JSON (S3 backup) | ~200MB |
 
 Total: ~560MB for a typical week. The 8GB Pi has plenty of room.
 
@@ -155,11 +161,13 @@ If you want to back up langfuse state, snapshot the three named volumes. The
 | langfuse-clickhouse | ~500MB | ~1.5GB |
 | langfuse-postgres | ~150MB | ~400MB |
 | langfuse-redis | ~30MB | ~100MB |
+| langfuse-minio | ~150MB | ~250MB |
 | langfuse-worker | ~250MB | ~500MB |
 | langfuse-web | ~300MB | ~700MB |
-| **Total** | **~1.2GB** | **~3.2GB** |
+| zookeeper | ~80MB | ~150MB |
+| **Total** | **~1.5GB** | **~3.6GB** |
 
-Pi 4 8GB has 4-5GB headroom even at peak. No swap, no special tuning needed.
+Pi 4 8GB has ~4GB headroom even at peak. No swap, no special tuning needed.
 
 ## Troubleshooting
 
@@ -172,6 +180,8 @@ Pi 4 8GB has 4-5GB headroom even at peak. No swap, no special tuning needed.
 | Auth callback fails on signup | `NEXTAUTH_URL` still set to `localhost:3001` | Override with public tunnel URL, restart `langfuse-web` |
 | `LANGFUSE_PUBLIC_KEY` invalid | Wrong project keys | Re-copy from Project Settings → API Keys |
 | Traces not appearing in UI | `langfuse.flush()` not called | Already handled in `ObservabilityMiddleware.after_agent`; check `runs/<session>/session.jsonl` for `langfuse_error` events |
+| `langfuse-worker` crashes immediately: "MonitorQueue is unavailable" | `REDIS_CONNECTION_STRING` env var not set | Add `REDIS_CONNECTION_STRING: redis://langfuse-redis:6379` to worker + web (langfuse code only reads this name, not `REDIS_URL`) |
+| `langfuse-web` 500 on OTel ingest: "Region is missing" | S3 not configured | MinIO service + S3 env vars required. langfuse v3 OTel ingest always writes to S3 before queuing; `LANGFUSE_S3_EVENT_UPLOAD_ENABLED` is bypassed |
 
 ## Why a custom ClickHouse
 
@@ -184,6 +194,21 @@ The `clickhouse-pi4/` directory uses the ARMv8.0 compatibility binary from
 with a glibc donor from Ubuntu 20.04. Based on:
 - [sqooid/docker-clickhouse-pi4](https://github.com/sqooid/docker-clickhouse-pi4)
 - [ClickHouse/ClickHouse#50852](https://github.com/ClickHouse/ClickHouse/issues/50852)
+
+## Why MinIO
+
+Langfuse v3 OTel ingest path always writes raw spans to S3 before queuing them
+for the worker — `LANGFUSE_S3_EVENT_UPLOAD_ENABLED` is bypassed in the OTel
+code path. Without a working S3 endpoint, the langfuse-web returns 500 with
+"Region is missing" and the trace is lost.
+
+MinIO is an S3-compatible blob store that runs as a single container (~150MB
+RAM idle). Langfuse ships with MinIO in its official docker-compose for this
+exact reason. The minio-init service creates the required bucket on first boot.
+
+Alternative: any S3-compatible service (AWS S3, Cloudflare R2, Backblaze B2,
+Wasabi). Configure via the same env vars; remove the `langfuse-minio` and
+`langfuse-minio-init` services and the `minio_data` volume.
 
 ## When you're done with M15
 
